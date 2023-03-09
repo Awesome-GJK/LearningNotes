@@ -1,1 +1,1 @@
-# GJK's Learning notes test
+# GJK's Learning notes
