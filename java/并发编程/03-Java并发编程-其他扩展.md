@@ -205,3 +205,167 @@
 > 在操作系统领域中，创建进程会用到`fork()`，传统的`fork()`函数会创建父进程的一个完整副本，这边也是用到的`Copy-on-Write`设计思想。
 >
 > 除了上面所说的领域外，我们还可以在很多其他领域看到`Copy-on-Write`的身影：Docker 容器镜像的设计是 Copy-on-Write、分布式源码管理系统 Git 背后 的设计思想都有 Copy-on-Write
+
+# 三、 线程本地存储模式
+
+> 我们知道多个线程同时读写同一共享变量存在并发问题，为此我们可以突破共享变量，没有共享变量就不会有并发问题，可以使用局部变量。正所谓没有共享，就没有伤害，本质上就是避免共享，除了局部变量，Java语言提供的线程本地存储（ThreadLocal）就能做到。
+
+## ThreadLocal 的使用方法
+
+> ```java
+> public class ThreadLocalDemo {
+> 
+>     private ThreadLocal<Integer> intThreadLocal = ThreadLocal.withInitial(() -> 0);
+> 
+>     private ThreadLocal<String> strThreadLocal = ThreadLocal.withInitial(() -> "Hello");
+> 
+>     private final Semaphore semaphore = new Semaphore(1);
+> 
+> 
+>     private static final ExecutorService executor = new ThreadPoolExecutor(
+>             Runtime.getRuntime().availableProcessors(),
+>             Runtime.getRuntime().availableProcessors() * 2,
+>             5L,
+>             TimeUnit.SECONDS,
+>             new LinkedBlockingQueue<>(20),
+>             new ThreadFactoryBuilder().setNameFormat("ThreadLocal-test-%d").build(),
+>             new ThreadPoolExecutor.CallerRunsPolicy());
+> 
+>     public class RunnableDemo implements Runnable {
+>         private String str;
+> 
+>         private Integer num;
+> 
+>         public RunnableDemo(String str, Integer num) {
+>             this.str = str;
+>             this.num = num;
+>         }
+> 
+>         @Override
+>         public void run() {
+>             try {
+> //                semaphore.acquire();
+>                 System.out.println(Thread.currentThread().getName() + "intThreadLocal:" + intThreadLocal.get());
+>                 System.out.println(Thread.currentThread().getName() + "strThreadLocal:" + strThreadLocal.get());
+> 
+>                 intThreadLocal.set(num);
+>                 strThreadLocal.set(strThreadLocal.get() + " " + str);
+> 
+>                 System.out.println(Thread.currentThread().getName() + "intThreadLocal:" + intThreadLocal.get());
+>                 System.out.println(Thread.currentThread().getName() + "strThreadLocal:" + strThreadLocal.get());
+> 
+>             } catch (Exception e) {
+>                 throw new RuntimeException(e);
+>             } finally {
+> //                semaphore.release();
+>             }
+>         }
+>     }
+> 
+>     public void execute() {
+>         RunnableDemo demo1 = new RunnableDemo("runnableDemo1", 100);
+>         RunnableDemo demo2 = new RunnableDemo("runnableDemo2", 200);
+>         RunnableDemo demo3 = new RunnableDemo("runnableDemo3", 300);
+>         executor.execute(demo1);
+>         executor.execute(demo2);
+>         executor.execute(demo3);
+>     }
+> 
+>     public static void main(String[] args) {
+>         ThreadLocalDemo threadLocalDemo = new ThreadLocalDemo();
+>         threadLocalDemo.execute();
+>     }
+> ```
+>
+> 以上面的代码为例，我们分别创建了一个`intThreadLocal`、`strThreadLocal` 和三个线程。三个线程、不加锁同时访问两个ThreadLocal，最终执行结果如下：
+>
+> ![image-20230309161532553](E:\learn&notes\notes\Java并发编程\images\03-Java并发编程-其他扩展\image-20230309161532553.png)
+>
+> 我们发现三个线程获取到的`intThreadLocal` 和`strThreadLocal` 的初始值是相同的，有人会怀疑是因为没有加锁，所以线程不安全，可能导致他们获取的是同一个值。我补充锁后再执行，结果如下：
+>
+> ![image-20230309161838929](E:\learn&notes\notes\Java并发编程\images\03-Java并发编程-其他扩展\image-20230309161838929.png)
+>
+> 很明显，结果依然相同，这都是 ThreadLocal 的杰作。`intThreadLocal`  和`strThreadLocal`就像局部变量存在于每个线程中。
+
+## ThreadLocal 的工作原理
+
+> 在解释 ThreadLocal 的工作原理之前， 你先自己想想：如果让你来实现 ThreadLocal 的功能，你会怎么设计呢？ThreadLocal 的目标是让不同的线程有不同的变量 V，那最直接的方法就是创建一个 Map，它的 Key 是线程，Value 是每个线程拥有的变量 V， ThreadLocal 内部持有这样的一个 Map 就可以了。你可以参考下面的示意图和示例代码来理解。
+>
+> ![image-20230309162112322](E:\learn&notes\notes\Java并发编程\images\03-Java并发编程-其他扩展\image-20230309162112322.png)
+>
+> 那 Java 的 ThreadLocal 是这么实现的吗？这一次我们的设计思路和 Java 的实现差异很 大。Java 的实现里面也有一个 Map，叫做 ThreadLocalMap，不过持有 ThreadLocalMap 的不是 ThreadLocal，而是 Thread。
+>
+> 我们先看看 ThreadLocalMap.get()方法的实现
+>
+> ```java
+>     /**
+>      * Returns the value in the current thread's copy of this
+>      * thread-local variable.  If the variable has no value for the
+>      * current thread, it is first initialized to the value returned
+>      * by an invocation of the {@link #initialValue} method.
+>      *
+>      * @return the current thread's value of this thread-local
+>      */
+>     public T get() {
+>         Thread t = Thread.currentThread();
+>         ThreadLocalMap map = getMap(t);
+>         if (map != null) {
+>             ThreadLocalMap.Entry e = map.getEntry(this);
+>             if (e != null) {
+>                 @SuppressWarnings("unchecked")
+>                 T result = (T)e.value;
+>                 return result;
+>             }
+>         }
+>         return setInitialValue();
+>     }
+> 
+>     /**
+>      * Get the map associated with a ThreadLocal. Overridden in
+>      * InheritableThreadLocal.
+>      *
+>      * @param  t the current thread
+>      * @return the map
+>      */
+>     ThreadLocalMap getMap(Thread t) {
+>         return t.threadLocals;
+>     }
+> 
+> ```
+>
+>  从`getMap(t)`方法中，我们可以看到，`ThreadLocalMap map`是从当前线程中获取的。Thread 这个类内部有一个私有属性 threadLocals，其类型就是 ThreadLocalMap，ThreadLocalMap 的 Key 是 ThreadLocal。
+>
+> ![image-20230309162416787](E:\learn&notes\notes\Java并发编程\images\03-Java并发编程-其他扩展\image-20230309162416787.png)
+>
+> 你可以结合下面的示意图来理解。
+>
+> ![image-20230309163017223](E:\learn&notes\notes\Java并发编程\images\03-Java并发编程-其他扩展\image-20230309163017223.png)
+>
+> 我们的设计方案和 Java 的实现仅仅是 Map 的持有方不同而已，我们的设计里 面 Map 属于 `ThreadLocal`，而 Java 的实现里面`ThreadLocalMap`则是属于`Thread`。这 两种方式哪种更合理呢？很显然 Java 的实现更合理些。在 Java 的实现方案里面，**ThreadLocal 仅仅是一个代理工具类，内部并不持有任何与线程相关的数据，所有和线程 相关的数据都存储在 Thread 里面**，这样的设计容易理解。而从数据的亲缘性上来讲， `ThreadLocalMap`属于`Thread` 也更加合理。
+>
+> 当然还有一个更加深层次的原因，那就是**不容易产生内存泄露**。在我们的设计方案中， `ThreadLocal`持有的 Map 会持有 `Thread`对象的引用，这就意味着，只要`ThreadLocal`对象存在，那么 Map 中的 `Thread`对象就永远不会被回收。`ThreadLocal`的生命周期往往 都比线程要长，所以这种设计方案很容易导致内存泄露。而 Java 的实现中 `Thread`持有 `ThreadLocalMap`，而且 `ThreadLocalMap`里对 `ThreadLocal`的引用还是弱引用（WeakReference），所以只要 `Thread`对象可以被回收，那么 `ThreadLocalMap`就能被 回收。Java 的这种实现方案虽然看上去复杂一些，但是更加安全。
+
+## ThreadLocal 与内存泄露
+
+> Java 的 `ThreadLocal`实现应该称得上深思熟虑了，不过即便如此深思熟虑，还是不能百分百地让程序员避免内存泄露，例如在线程池中使用 `ThreadLocal`，如果不谨慎就可能导致内存泄露。
+>
+> 在线程池中使用 `ThreadLocal`为什么可能导致内存泄露呢？原因就出在线程池中线程的存活时间太长，往往都是和程序同生共死的，这就意味着 `Thread`持有的 `ThreadLocalMap`一直都不会被回收，虽然 `ThreadLocalMap`中的 Entry 对 `ThreadLocal`是弱引用 （WeakReference）， 但是 Entry 中的 Value 却是被 Entry 强引用的，所以即便 Value 的生命周期结束了， Value 也是无法被回收的，从而导致内存泄露。
+>
+> 那在线程池中，我们该如何正确使用 `ThreadLocal`呢？其实很简单，既然 JVM 不能做到自动释放对 Value 的强引用，那我们手动释放就可以了。利用**try{}finally{}方案**了，这个简直就是手动释放资源的利器。
+>
+> ```java
+> ExecutorService es;
+> ThreadLocal tl;
+> es.execute(()->{
+>     //ThreadLocal 增加变量
+>     tl.set(obj);
+>     try {
+>         // 省略业务逻辑代码
+>     }finally {
+>         // 手动清理 ThreadLocal
+>         tl.remove();
+>     }
+> });
+> 
+> ```
+
